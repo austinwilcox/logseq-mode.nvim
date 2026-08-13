@@ -6,6 +6,11 @@ M.defaults = {
 	additional_dirs = {},
 	-- Amount of extra space between lines (only works in GUI clients)
 	linespace = 4,
+	-- Task marker cycle. Last entry is treated as the "closed" state
+	-- (excluded from :LogseqTodos and :LogseqAgenda).
+	markers = { "TODO", "DOING", "DONE" },
+	-- Default window for :LogseqAgenda, in days
+	agenda_days = 14,
 }
 
 M.options = {}

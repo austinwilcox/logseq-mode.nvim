@@ -1,5 +1,7 @@
 local Config = require("logseq_mode.config")
 local Formatter = require("logseq_mode.formatter")
+local Markers = require("logseq_mode.markers")
+local Schedule = require("logseq_mode.schedule")
 
 local M = {}
 
@@ -40,20 +42,47 @@ local function move_tree(direction)
 end
 
 -- Helper for auto-bullet
-local function get_bullet_prefix()
-	local line = vim.api.nvim_get_current_line()
-	-- Match leading whitespace + bullet + space
-	local indent, bullet = line:match("^(%s*)(%- )")
-	if indent and bullet then
+local function get_bullet_prefix(line)
+	line = line or vim.api.nvim_get_current_line()
+	-- Match leading whitespace + bullet (with or without trailing space)
+	local indent = line:match("^(%s*)%-%s")
+	if not indent then
+		-- Also treat a bare "-" (empty bullet) as a bullet line
+		indent = line:match("^(%s*)%-$")
+	end
+	if indent then
 		return indent .. "- "
 	end
 	return nil
 end
 
-function M.daily_note()
-	local date = os.date("%Y_%m_%d")
-	local path = Config.options.logseq_dir .. "/journals/" .. date .. ".md"
-	vim.cmd("edit " .. path)
+-- Leading whitespace of the current line ('autoindent' is off in these buffers,
+-- so new lines carry the indent explicitly)
+local function get_indent_prefix()
+	return vim.api.nvim_get_current_line():match("^(%s*)")
+end
+
+-- Drop one indent level from a bullet prefix (tab, or 2 spaces)
+local function outdent_prefix(prefix)
+	local indent = prefix:match("^(%s*)")
+	if indent:sub(-1) == "\t" then
+		return indent:sub(1, -2) .. "- "
+	elseif indent:sub(-2) == "  " then
+		return indent:sub(1, -3) .. "- "
+	end
+	return nil
+end
+
+--- Open a journal page. `spec` is any date spec understood by Schedule.parse_date
+--- ("" = today, "+1d", "tomorrow", "fri", "2026-09-01", ...).
+function M.daily_note(spec)
+	local ts, err = Schedule.parse_date(spec)
+	if not ts then
+		vim.notify(err, vim.log.levels.ERROR)
+		return
+	end
+	local path = Config.options.logseq_dir .. "/journals/" .. os.date("%Y_%m_%d", ts) .. ".md"
+	vim.cmd("edit " .. vim.fn.fnameescape(path))
 end
 
 function M.unified_search()
@@ -89,7 +118,21 @@ function M.setup(opts)
 	Config.setup(opts)
 
 	-- Register User Commands
-	vim.api.nvim_create_user_command("LogseqDaily", M.daily_note, {})
+	vim.api.nvim_create_user_command("LogseqDaily", function(cmd)
+		M.daily_note(cmd.args)
+	end, { nargs = "?", desc = "Open a journal page (date spec: +1d, tomorrow, fri, 2026-09-01)" })
+	vim.api.nvim_create_user_command("LogseqSchedule", function(cmd)
+		Schedule.stamp("SCHEDULED", cmd.args)
+	end, { nargs = "*", desc = "Add SCHEDULED: <date> to the current block" })
+	vim.api.nvim_create_user_command("LogseqDeadline", function(cmd)
+		Schedule.stamp("DEADLINE", cmd.args)
+	end, { nargs = "*", desc = "Add DEADLINE: <date> to the current block" })
+	vim.api.nvim_create_user_command("LogseqAgenda", function(cmd)
+		Schedule.agenda(tonumber(cmd.args))
+	end, { nargs = "?", desc = "Quickfix list of upcoming/overdue scheduled blocks" })
+	vim.api.nvim_create_user_command("LogseqTodos", function()
+		Schedule.todos()
+	end, { desc = "Quickfix list of open marker blocks" })
 
 	-- Register Formatter if Conform is loaded
 	local has_conform, conform = pcall(require, "conform")
@@ -124,6 +167,16 @@ function M.setup(opts)
 				vim.opt_local.breakindentopt = "shift:2"
 				vim.opt_local.scrolloff = 0
 
+				-- Bullet continuation supplies its own indent, so keep Vim from
+				-- adding one too (an extra auto-indent would double the leading tabs).
+				vim.opt_local.autoindent = false
+				vim.opt_local.smartindent = false
+				vim.opt_local.cindent = false
+				vim.opt_local.indentexpr = ""
+				-- Don't let 'comments' auto-insert "- " on top of ours
+				vim.opt_local.formatoptions:remove("r")
+				vim.opt_local.formatoptions:remove("o")
+
 				-- Keymaps
 				local map = function(mode, lhs, rhs, desc)
 					vim.keymap.set(mode, lhs, rhs, { buffer = ev.buf, desc = desc, silent = true })
@@ -143,33 +196,74 @@ function M.setup(opts)
 				-- Auto-continuation: Enter
 				map_expr("i", "<CR>", function()
 					local prefix = get_bullet_prefix()
+					if not prefix then
+						return "<CR>" .. get_indent_prefix()
+					end
 					local line = vim.api.nvim_get_current_line()
-					if prefix and line == prefix then
-						return "<BS><BS><CR>" -- Deletes "- " then CR
+					-- Empty bullet: outdent it, or drop the bullet at top level
+					if line:match("^%s*%-%s*$") then
+						local outdented = outdent_prefix(prefix)
+						if outdented then
+							return "<Esc>cc" .. outdented
+						end
+						return "<Esc>cc"
 					end
-					if prefix then
-						return "<CR><C-u>" .. prefix
-					end
-					return "<CR>"
+					-- 'autoindent' is off in these buffers, so the prefix carries the indent
+					return "<CR>" .. prefix
 				end, "Logseq List Continuation")
 
-				-- Auto-continuation: o
+				-- Auto-continuation: o (keeps SCHEDULED:/DEADLINE: lines attached to their block)
 				map_expr("n", "o", function()
-					local prefix = get_bullet_prefix()
-					if prefix then
-						return "o<C-u>" .. prefix
+					local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+					local row = vim.api.nvim_win_get_cursor(0)[1]
+					local bullet
+					for r = row, 1, -1 do
+						if lines[r]:match("^%s*%-%s") then
+							bullet = r
+							break
+						end
 					end
-					return "o"
+					if not bullet then
+						return "o" .. get_indent_prefix()
+					end
+					-- Step past the block's property lines so the new bullet lands after them
+					local target = bullet
+					while lines[target + 1] and Schedule.is_property_line(lines[target + 1]) do
+						target = target + 1
+					end
+					local down = math.max(0, target - row)
+					return string.rep("j", down) .. "o" .. get_bullet_prefix(lines[bullet])
 				end, "Logseq New Line Below")
 
 				-- Auto-continuation: O
 				map_expr("n", "O", function()
-					local prefix = get_bullet_prefix()
-					if prefix then
-						return "O<C-u>" .. prefix
-					end
-					return "O"
+					return "O" .. (get_bullet_prefix() or get_indent_prefix())
 				end, "Logseq New Line Above")
+
+				-- Task markers
+				map("n", "<leader>zt", function()
+					Markers.cycle(false)
+				end, "Logseq Cycle Marker")
+				map("n", "<leader>zT", function()
+					Markers.cycle(true)
+				end, "Logseq Cycle Marker Backwards")
+				map("n", "<leader>zx", Markers.toggle_done, "Logseq Toggle Done")
+
+				-- Scheduling
+				map("n", "<leader>zs", function()
+					vim.ui.input({ prompt = "SCHEDULED (e.g. +3d, fri, 2026-09-01): " }, function(input)
+						if input then
+							Schedule.stamp("SCHEDULED", input)
+						end
+					end)
+				end, "Logseq Schedule Block")
+				map("n", "<leader>zd", function()
+					vim.ui.input({ prompt = "DEADLINE (e.g. +3d, fri, 2026-09-01): " }, function(input)
+						if input then
+							Schedule.stamp("DEADLINE", input)
+						end
+					end)
+				end, "Logseq Deadline Block")
 
 				-- Hoisting
 				map("n", "<leader>zl", M.hoist_block, "Logseq Hoist Block")
